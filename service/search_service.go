@@ -280,9 +280,12 @@ func writeSearchCacheByCompleteness(outcome *batchSearchOutcome, cacheKey string
 		return
 	}
 
+	// 在启动异步写入前固定依赖，后台任务不再读取可被替换的全局配置与缓存。
+	targetCache := enhancedTwoLevelCache
+	logEnabled := config.AppConfig.AsyncLogEnabled
 	go func(res []model.SearchResult, cacheTTL time.Duration) {
-		written := writeFinalMainCache(enhancedTwoLevelCache, cacheKey, res, cacheTTL)
-		if config.AppConfig != nil && config.AppConfig.AsyncLogEnabled {
+		written := writeFinalMainCache(targetCache, cacheKey, res, cacheTTL)
+		if logEnabled {
 			fmt.Printf("[%s] 缓存更新完成: %s | 本次 %d 条 -> 合并后 %d 条 | TTL: %.0f分钟\n",
 				sender, cacheKey, len(res), written, cacheTTL.Minutes())
 		}
