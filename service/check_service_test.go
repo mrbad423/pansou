@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -127,7 +128,7 @@ func TestCheck115ShareState(test *testing.T) {
 		{
 			name:        "empty share response",
 			response:    `{"state":true,"errno":0,"data":{}}`,
-			wantState:   checkStateBad,
+			wantState:   checkStateUncertain,
 			wantSummary: "链接状态异常(share_state=0)",
 		},
 		{
@@ -165,7 +166,7 @@ func TestCheck115ShareState(test *testing.T) {
 				URL:      "https://115.com/s/swff16b3ngy?password=CNYY",
 			}
 
-			result, err := service.check115(item, item.URL, client)
+			result, err := service.check115(context.Background(), item, item.URL, client)
 			if err != nil {
 				test.Fatalf("check115 returned an error: %v", err)
 			}

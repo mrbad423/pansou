@@ -176,6 +176,18 @@ func SearchHandler(c *gin.Context) {
 		}
 	}
 
+	if c.Request.Method == http.MethodGet {
+		if err := parseSearchCheckQuery(c, &req); err != nil {
+			c.JSON(http.StatusBadRequest, model.NewErrorResponse(400, err.Error()))
+			return
+		}
+	}
+	checkOptions, err := searchCheckOptions(req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, model.NewErrorResponse(400, err.Error()))
+		return
+	}
+
 	// 请求指定的频道/插件数量必须封顶：它会被当作 TG 路径的工作池大小，
 	// 直接决定 goroutine 数与出站请求数（见 service.searchTG）。
 	if channelsOverLimit(len(req.Channels)) {
@@ -231,6 +243,11 @@ func SearchHandler(c *gin.Context) {
 	// 应用过滤器
 	if req.Filter != nil {
 		result = applyResultFilter(result, req.Filter, req.ResultType)
+	}
+
+	// 在请求级副本上检测、过滤，原始搜索缓存不受影响。
+	if checkOptions.Enabled {
+		result = getSearchLinkChecker().Apply(c.Request.Context(), result, req.ResultType, checkOptions)
 	}
 
 	// 包装SearchResponse到标准响应格式中

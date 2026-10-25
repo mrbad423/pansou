@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# Override with an upstream tag/digest when a fully pinned frontend is needed.
+ARG PANSOU_WEB_BASE=ghcr.io/fish2018/pansou-web:latest
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/pansou .
+
+# Keep the official frontend, Nginx, startup script, healthcheck and plugin/channel
+# environment defaults; replace only the backend with this fork's implementation.
+FROM ${PANSOU_WEB_BASE}
+WORKDIR /app
+COPY --from=builder /out/pansou /app/pansou
+ENV PORT=8888 \
+    PANSOU_PORT=8888 \
+    PANSOU_HOST=127.0.0.1 \
+    CACHE_PATH=/app/data/cache \
+    LOG_PATH=/app/data/logs \
+    SEARCH_CHECK_LINKS=true \
+    SEARCH_FILTER_INVALID=true \
+    SEARCH_CHECK_LIMIT=20 \
+    SEARCH_CHECK_BUDGET_MS=2000
+EXPOSE 80
+ENTRYPOINT ["/bin/bash", "/app/start.sh"]
+CMD []

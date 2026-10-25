@@ -4,11 +4,12 @@ import "time"
 
 // Link 网盘链接
 type Link struct {
-	Type      string    `json:"type" sonic:"type"`
-	URL       string    `json:"url" sonic:"url"`
-	Password  string    `json:"password" sonic:"password"`
-	Datetime  time.Time `json:"datetime,omitempty" sonic:"datetime,omitempty"`     // 链接更新时间（可选）
-	WorkTitle string    `json:"work_title,omitempty" sonic:"work_title,omitempty"` // 作品标题（用于区分同一消息中多个作品的链接）
+	Type      string       `json:"type" sonic:"type"`
+	URL       string       `json:"url" sonic:"url"`
+	Password  string       `json:"password" sonic:"password"`
+	Datetime  time.Time    `json:"datetime,omitempty" sonic:"datetime,omitempty"`     // 链接更新时间（可选）
+	WorkTitle string       `json:"work_title,omitempty" sonic:"work_title,omitempty"` // 作品标题（用于区分同一消息中多个作品的链接）
+	LinkCheck *CheckResult `json:"link_check,omitempty" sonic:"link_check,omitempty"`
 }
 
 // SearchResult 搜索结果
@@ -26,12 +27,13 @@ type SearchResult struct {
 
 // MergedLink 合并后的网盘链接
 type MergedLink struct {
-	URL      string    `json:"url" sonic:"url"`
-	Password string    `json:"password" sonic:"password"`
-	Note     string    `json:"note" sonic:"note"`
-	Datetime time.Time `json:"datetime" sonic:"datetime"`
-	Source   string    `json:"source,omitempty" sonic:"source,omitempty"` // 数据来源：tg:频道名 或 plugin:插件名
-	Images   []string  `json:"images,omitempty" sonic:"images,omitempty"` // TG消息中的图片链接
+	URL       string       `json:"url" sonic:"url"`
+	Password  string       `json:"password" sonic:"password"`
+	Note      string       `json:"note" sonic:"note"`
+	Datetime  time.Time    `json:"datetime" sonic:"datetime"`
+	Source    string       `json:"source,omitempty" sonic:"source,omitempty"` // 数据来源：tg:频道名 或 plugin:插件名
+	Images    []string     `json:"images,omitempty" sonic:"images,omitempty"` // TG消息中的图片链接
+	LinkCheck *CheckResult `json:"link_check,omitempty" sonic:"link_check,omitempty"`
 }
 
 // MergedLinks 按网盘类型分组的合并链接
@@ -39,9 +41,10 @@ type MergedLinks map[string][]MergedLink
 
 // SearchResponse 搜索响应
 type SearchResponse struct {
-	Total        int            `json:"total" sonic:"total"`
-	Results      []SearchResult `json:"results,omitempty" sonic:"results,omitempty"`
-	MergedByType MergedLinks    `json:"merged_by_type,omitempty" sonic:"merged_by_type,omitempty"`
+	Total        int                     `json:"total" sonic:"total"`
+	Results      []SearchResult          `json:"results,omitempty" sonic:"results,omitempty"`
+	MergedByType MergedLinks             `json:"merged_by_type,omitempty" sonic:"merged_by_type,omitempty"`
+	LinkCheck    *SearchLinkCheckSummary `json:"link_check,omitempty" sonic:"link_check,omitempty"`
 }
 
 // Response API通用响应

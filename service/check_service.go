@@ -68,7 +68,7 @@ func NewCheckService() *CheckService {
 		cache:     make(map[string]cachedCheckResult),
 		inflight:  make(map[string]*activeCheckCall),
 		client:    util.GetHTTPClient(),
-		cacheFile: filepath.Join(".", "cache", "check_cache.db"),
+		cacheFile: filepath.Join(checkCacheDirectory(), "check_cache.db"),
 	}
 	service.openCacheStore()
 	service.pruneExpiredCacheStore()
@@ -108,35 +108,40 @@ func (s *CheckService) CheckWithProxy(items []model.CheckItem, proxyURL string) 
 }
 
 func (s *CheckService) checkOne(item model.CheckItem, client *http.Client, cacheScope string) model.CheckResult {
+	return s.checkOneContext(context.Background(), item, client, cacheScope)
+}
+
+func (s *CheckService) checkOneContext(ctx context.Context, item model.CheckItem, client *http.Client, cacheScope string) model.CheckResult {
 	normalized := s.normalizeShareLink(item.DiskType, item.URL, item.Password)
 	if normalized == "" {
 		return s.buildResult(item, "", checkStateUncertain, false, "链接格式无效")
 	}
 
-	cacheKey := checkCacheKey(item.DiskType, normalized, cacheScope)
+	cacheKey := checkItemCacheKey(item, normalized, cacheScope)
 	if cached, ok := s.getCached(cacheKey); ok {
 		cached.CacheHit = true
+		cached.URL = item.URL
 		return cached
 	}
 
 	call, wait := s.acquireInflight(cacheKey)
 	if wait {
-		<-call.done
-		if call.err != nil {
-			return s.buildResult(item, normalized, checkStateUncertain, false, "检测失败")
+		select {
+		case <-ctx.Done():
+			return s.buildResult(item, normalized, checkStateUncertain, false, "检测超时或取消")
+		case <-call.done:
+			result := call.result
+			result.URL = item.URL
+			return result
 		}
-		result := call.result
-		result.CacheHit = false
-		return result
 	}
 
-	result, err := s.runCheck(item, normalized, client)
-	s.finishInflight(cacheKey, call, result, err)
-
+	result, err := s.runCheck(ctx, item, normalized, client)
 	if err != nil {
-		return s.buildResult(item, normalized, checkStateUncertain, false, "检测失败")
+		result = s.buildResult(item, normalized, checkStateUncertain, false, "检测失败或超时")
 	}
-
+	// 短暂缓存失败，避免上游故障时每次搜索重复发起网络请求。
+	s.finishInflight(cacheKey, call, result, nil)
 	return result
 }
 
@@ -147,7 +152,7 @@ func (s *CheckService) getCached(key string) (model.CheckResult, bool) {
 		if time.Now().After(entry.expiresAt) {
 			delete(s.cache, key)
 			s.mu.Unlock()
-			s.deletePersistentCache(key)
+			// Expired disk entries are reclaimed on startup/cap eviction, not on the request path.
 			return model.CheckResult{}, false
 		}
 
@@ -163,15 +168,30 @@ func (s *CheckService) getCached(key string) (model.CheckResult, bool) {
 	}
 
 	if time.Now().After(entry.expiresAt) {
-		s.deletePersistentCache(key)
+		// Expired disk entries are reclaimed on startup/cap eviction, not on the request path.
 		return model.CheckResult{}, false
 	}
 
 	s.mu.Lock()
-	s.cache[key] = entry
+	s.rememberCheckResultLocked(key, entry)
 	s.mu.Unlock()
 
 	return entry.result, true
+}
+
+func (s *CheckService) rememberCheckResultLocked(key string, entry cachedCheckResult) {
+	const maxEntries = 4096
+	if _, exists := s.cache[key]; !exists && len(s.cache) >= maxEntries {
+		oldestKey := ""
+		var oldestTime int64
+		for candidate, cached := range s.cache {
+			if oldestKey == "" || cached.result.CheckedAt < oldestTime {
+				oldestKey, oldestTime = candidate, cached.result.CheckedAt
+			}
+		}
+		delete(s.cache, oldestKey)
+	}
+	s.cache[key] = entry
 }
 
 func (s *CheckService) acquireInflight(key string) (*activeCheckCall, bool) {
@@ -200,7 +220,7 @@ func (s *CheckService) finishInflight(key string, call *activeCheckCall, result 
 			result:    result,
 			expiresAt: time.UnixMilli(result.ExpiresAt),
 		}
-		s.cache[key] = entry
+		s.rememberCheckResultLocked(key, entry)
 	}
 
 	delete(s.inflight, key)
@@ -212,38 +232,38 @@ func (s *CheckService) finishInflight(key string, call *activeCheckCall, result 
 	}
 }
 
-func (s *CheckService) runCheck(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) runCheck(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	switch item.DiskType {
 	case "aliyun":
-		return s.checkAliyun(item, normalized, client)
+		return s.checkAliyun(parent, item, normalized, client)
 	case "quark":
-		return s.checkQuark(item, normalized, client)
+		return s.checkQuark(parent, item, normalized, client)
 	case "uc":
-		return s.checkUC(item, normalized, client)
+		return s.checkUC(parent, item, normalized, client)
 	case "baidu":
-		return s.checkBaidu(item, normalized, client)
+		return s.checkBaidu(parent, item, normalized, client)
 	case "tianyi":
-		return s.checkTianyi(item, normalized, client)
+		return s.checkTianyi(parent, item, normalized, client)
 	case "123":
-		return s.check123(item, normalized, client)
+		return s.check123(parent, item, normalized, client)
 	case "xunlei":
-		return s.checkXunlei(item, normalized, client)
+		return s.checkXunlei(parent, item, normalized, client)
 	case "115":
-		return s.check115(item, normalized, client)
+		return s.check115(parent, item, normalized, client)
 	case "mobile":
-		return s.checkMobile(item, normalized, client)
+		return s.checkMobile(parent, item, normalized, client)
 	default:
 		return s.buildResult(item, normalized, checkStateUnsupported, false, "当前平台暂不支持检测"), nil
 	}
 }
 
-func (s *CheckService) checkAliyun(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) checkAliyun(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID := extractAliyunShareID(normalized)
 	if shareID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -274,9 +294,7 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string, clie
 		codeLower := strings.ToLower(code)
 		message := coalesce(parsed.Message, code)
 		switch {
-		case strings.Contains(codeLower, "sharelink"):
-			return s.buildResult(item, normalized, checkStateBad, false, message), nil
-		case containsAny(codeLower, []string{"notfound", "cancelled", "canceled", "forbidden", "expired"}):
+		case containsAny(codeLower, []string{"sharelinknotfound", "sharelinkcancelled", "sharelinkcanceled", "sharelinkforbidden", "sharelinkexpired", "sharelink.notfound", "sharelink.cancelled", "sharelink.canceled", "sharelink.forbidden", "sharelink.expired"}):
 			return s.buildResult(item, normalized, checkStateBad, false, message), nil
 		case containsAny(codeLower, []string{"exceed", "frequency", "limit"}):
 			return s.buildResult(item, normalized, checkStateUncertain, false, message), nil
@@ -286,7 +304,7 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string, clie
 	}
 
 	if parsed.FileCount != nil && *parsed.FileCount == 0 && parsed.ShareName == "" {
-		return s.buildResult(item, normalized, checkStateBad, false, "分享内容为空(file_count=0)"), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, "分享内容为空，无法确认链接状态"), nil
 	}
 
 	shareStatus := strings.ToLower(strings.TrimSpace(parsed.ShareStatus))
@@ -306,13 +324,13 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string, clie
 	}
 }
 
-func (s *CheckService) checkQuark(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) checkQuark(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	resourceID, password := extractQuarkShareIDAndPassword(normalized)
 	if resourceID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -346,7 +364,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string, clien
 	case 41004, 41010, 41011:
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	default:
-		if containsAny(strings.ToLower(tokenResp.Message), []string{"不存在", "失效", "违规", "过期", "取消"}) {
+		if explicitShareFailure(tokenResp.Message) {
 			return s.buildResult(item, normalized, checkStateBad, false, tokenResp.Message), nil
 		}
 		if containsAny(strings.ToLower(tokenResp.Message), []string{"提取码", "密码"}) {
@@ -356,7 +374,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string, clien
 	}
 
 	if tokenResp.Status != 0 && tokenResp.Status != http.StatusOK {
-		return s.buildResult(item, normalized, checkStateBad, false, coalesce(tokenResp.Message, "分享链接失效或不存在")), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, coalesce(tokenResp.Message, "分享接口状态异常")), nil
 	}
 
 	if tokenResp.Data.Stoken == "" {
@@ -397,7 +415,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string, clien
 		switch {
 		case containsAny(messageLower, []string{"提取码", "密码", "passcode"}):
 			return s.buildResult(item, normalized, checkStateLocked, false, message), nil
-		case containsAny(messageLower, []string{"不存在", "失效", "违规", "过期", "取消"}):
+		case explicitShareFailure(message):
 			return s.buildResult(item, normalized, checkStateBad, false, message), nil
 		default:
 			return s.buildResult(item, normalized, checkStateUncertain, false, message), nil
@@ -414,7 +432,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string, clien
 		case detailResp.Data.IsExpire:
 			return s.buildResult(item, normalized, checkStateBad, false, "分享链接已过期"), nil
 		default:
-			return s.buildResult(item, normalized, checkStateBad, false, "分享链接无效：文件列表为空"), nil
+			return s.buildResult(item, normalized, checkStateUncertain, false, "文件列表为空，无法确认分享状态"), nil
 		}
 	}
 
@@ -436,8 +454,8 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string, clien
 	}
 }
 
-func (s *CheckService) checkUC(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+func (s *CheckService) checkUC(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -454,7 +472,7 @@ func (s *CheckService) checkUC(item model.CheckItem, normalized string, client *
 
 	pageText := strings.ToLower(string(body))
 	switch {
-	case containsAny(pageText, []string{"失效", "不存在", "违规", "删除", "已过期", "被取消"}):
+	case containsAny(pageText, []string{"分享已失效", "链接已失效", "分享不存在", "链接不存在", "文件已被删除", "分享已过期", "分享已取消"}):
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	case containsAny(pageText, []string{"提取码", "访问码", "请输入密码"}):
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要提取码"), nil
@@ -465,13 +483,13 @@ func (s *CheckService) checkUC(item model.CheckItem, normalized string, client *
 	}
 }
 
-func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) checkBaidu(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID, shortURL, password := extractBaiduShareInfo(normalized)
 	if shareID == "" || shortURL == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -534,7 +552,7 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, clien
 		if len(listResp.List) > 0 {
 			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
 		}
-		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, "文件列表为空，无法确认分享状态"), nil
 	case -9, -12:
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要提取码"), nil
 	case -7, 105, 115, 117, 145:
@@ -544,13 +562,13 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, clien
 	}
 }
 
-func (s *CheckService) checkTianyi(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) checkTianyi(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareCode, password, referer := extractTianyiShareInfo(normalized, item.Password)
 	if shareCode == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -613,10 +631,10 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string, clie
 			return s.buildResult(item, normalized, checkStateBad, false, message), nil
 		case containsAny(messageLower, []string{"accesscode", "访问码", "提取码", "密码"}):
 			return s.buildResult(item, normalized, checkStateLocked, false, message), nil
-		case containsAny(messageLower, []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "foldernotfound", "不存在", "失效", "取消", "过期"}):
+		case explicitShareFailure(message):
 			return s.buildResult(item, normalized, checkStateBad, false, message), nil
 		}
-		return s.buildResult(item, normalized, checkStateBad, false, message), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, message), nil
 	}
 
 	var jsonResponse struct {
@@ -639,7 +657,7 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string, clie
 			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
 		case jsonResponse.NeedAccessCode == 1:
 			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
-		case jsonResponse.ErrorCode != "":
+		case isKnownTianyiErrorCode(jsonResponse.ErrorCode):
 			return s.buildResult(item, normalized, checkStateBad, false, mapTianyiErrorMessage(jsonResponse.ErrorCode, jsonResponse.ResMessage)), nil
 		case containsAny(strings.ToLower(jsonResponse.ResMessage), []string{"accesscode", "访问码", "提取码", "密码"}):
 			return s.buildResult(item, normalized, checkStateLocked, false, coalesce(jsonResponse.ResMessage, "需要访问码")), nil
@@ -661,20 +679,20 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string, clie
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
 	case containsAny(strings.ToLower(bodyText), []string{"erroraccesscode", "needaccesscode", "访问码", "提取码", "密码"}):
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要访问码"), nil
-	case containsAny(strings.ToLower(bodyText), []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "foldernotfound", "不存在", "失效", "取消", "过期"}):
+	case explicitShareFailure(bodyText):
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	default:
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
 	}
 }
 
-func (s *CheckService) check123(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) check123(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareKey := extract123ShareKey(normalized)
 	if shareKey == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -704,20 +722,22 @@ func (s *CheckService) check123(item model.CheckItem, normalized string, client 
 		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
 	case response.Data.HasPwd:
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要提取码"), nil
-	case response.Message != "":
+	case containsAny(strings.ToLower(response.Message), []string{"提取码", "密码", "passcode"}):
+		return s.buildResult(item, normalized, checkStateLocked, false, response.Message), nil
+	case containsAny(strings.ToLower(response.Message), []string{"分享已取消", "链接已失效", "分享已失效", "分享不存在", "分享已过期", "share expired", "share not found"}):
 		return s.buildResult(item, normalized, checkStateBad, false, response.Message), nil
 	default:
-		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, coalesce(response.Message, "无法确认链接状态")), nil
 	}
 }
 
-func (s *CheckService) checkXunlei(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) checkXunlei(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID, password := extractXunleiShareInfo(normalized)
 	if shareID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -747,8 +767,8 @@ func (s *CheckService) checkXunlei(item model.CheckItem, normalized string, clie
 
 	body, _ = decompressResponseBody(body, headers["accept-encoding"], "")
 
-	if statusCode == http.StatusNotFound || statusCode == http.StatusForbidden {
-		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
+	if statusCode == http.StatusNotFound {
+		return s.buildResult(item, normalized, checkStateUncertain, false, "分享接口返回404，无法确认链接状态"), nil
 	}
 
 	var response struct {
@@ -777,19 +797,16 @@ func (s *CheckService) checkXunlei(item model.CheckItem, normalized string, clie
 		return s.buildResult(item, normalized, checkStateLocked, false, coalesce(response.ShareStatusText, "需要提取码")), nil
 	case response.ShareStatus != "" && response.ShareStatus != "OK":
 		summary := coalesce(response.ShareStatusText, fmt.Sprintf("分享状态: %s", response.ShareStatus))
-		if containsAny(strings.ToLower(summary), []string{"不存在", "失效", "过期", "not found", "deleted"}) {
+		if explicitShareFailure(summary) {
 			return s.buildResult(item, normalized, checkStateBad, false, summary), nil
 		}
-		return s.buildResult(item, normalized, checkStateBad, false, summary), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, summary), nil
 	case response.ErrorCode != 0 || response.Error != "" || response.ErrorMsg != "":
-		if containsAny(strings.ToLower(response.ErrorMsg), []string{"参数错误", "share_status", "不存在", "失效", "过期", "not found"}) {
+		if containsAny(strings.ToLower(response.ErrorMsg), []string{"分享不存在", "链接已失效", "分享已过期", "share not found", "share_not_found", "share_expired", "share_deleted"}) {
 			return s.buildResult(item, normalized, checkStateBad, false, coalesce(response.ErrorMsg, "链接失效")), nil
 		}
-		if containsAny(strings.ToLower(response.Error), []string{"参数错误", "share_status", "不存在", "失效", "过期", "not found"}) {
+		if containsAny(strings.ToLower(response.Error), []string{"分享不存在", "链接已失效", "分享已过期", "share not found", "share_not_found", "share_expired", "share_deleted"}) {
 			return s.buildResult(item, normalized, checkStateBad, false, coalesce(response.ErrorMsg, response.Error)), nil
-		}
-		if containsAny(strings.ToLower(response.ErrorMsg), []string{"not found", "不存在", "失效", "过期"}) {
-			return s.buildResult(item, normalized, checkStateBad, false, coalesce(response.ErrorMsg, "链接失效")), nil
 		}
 		return s.buildResult(item, normalized, checkStateUncertain, false, coalesce(response.ErrorMsg, response.Error)), nil
 	default:
@@ -797,7 +814,7 @@ func (s *CheckService) checkXunlei(item model.CheckItem, normalized string, clie
 	}
 }
 
-func (s *CheckService) check115(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) check115(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareCode, password := extract115ShareInfo(normalized, item.Password)
 	if shareCode == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -806,7 +823,7 @@ func (s *CheckService) check115(item model.CheckItem, normalized string, client 
 		return s.buildResult(item, normalized, checkStateLocked, false, "115 需要提取码"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -867,14 +884,17 @@ func (s *CheckService) check115(item model.CheckItem, normalized string, client 
 		if containsAny(strings.ToLower(reason), []string{"密码", "提取码"}) {
 			return s.buildResult(item, normalized, checkStateLocked, false, reason), nil
 		}
-		return s.buildResult(item, normalized, checkStateBad, false, reason), nil
+		if shareState == 7 || containsAny(strings.ToLower(reason), []string{"分享已取消", "链接已过期", "分享不存在", "链接已失效", "分享已失效"}) {
+			return s.buildResult(item, normalized, checkStateBad, false, reason), nil
+		}
+		return s.buildResult(item, normalized, checkStateUncertain, false, reason), nil
 	}
 
 	if containsAny(strings.ToLower(response.Error), []string{"密码", "提取码", "receive_code"}) {
 		return s.buildResult(item, normalized, checkStateLocked, false, coalesce(response.Error, "需要提取码")), nil
 	}
 
-	if containsAny(strings.ToLower(response.Error), []string{"参数错误", "不存在", "失效", "share_code", "forbid", "forbidden", "违规", "删除", "取消"}) {
+	if containsAny(strings.ToLower(response.Error), []string{"分享不存在", "链接已失效", "链接已过期", "分享已取消", "分享已删除", "share_not_found", "share_expired"}) {
 		return s.buildResult(item, normalized, checkStateBad, false, coalesce(response.Error, "链接失效")), nil
 	}
 
@@ -882,16 +902,16 @@ func (s *CheckService) check115(item model.CheckItem, normalized string, client 
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
 	}
 
-	return s.buildResult(item, normalized, checkStateBad, false, response.Error), nil
+	return s.buildResult(item, normalized, checkStateUncertain, false, response.Error), nil
 }
 
-func (s *CheckService) checkMobile(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
+func (s *CheckService) checkMobile(parent context.Context, item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID := extractMobileShareID(normalized)
 	if shareID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	ctx = contextWithCheckHTTPClient(ctx, client)
 
@@ -953,12 +973,12 @@ func (s *CheckService) checkMobile(item model.CheckItem, normalized string, clie
 	case containsAny(strings.ToLower(description), []string{"提取码", "密码", "访问码"}):
 		return s.buildResult(item, normalized, checkStateLocked, false, coalesce(description, "需要提取码")), nil
 	case description != "":
-		if containsAny(strings.ToLower(description), []string{"失效", "不存在", "过期", "取消"}) {
+		if explicitShareFailure(description) {
 			return s.buildResult(item, normalized, checkStateBad, false, description), nil
 		}
 		return s.buildResult(item, normalized, checkStateUncertain, false, description), nil
 	case resultCode != "":
-		return s.buildResult(item, normalized, checkStateBad, false, "错误码: "+resultCode), nil
+		return s.buildResult(item, normalized, checkStateUncertain, false, "错误码: "+resultCode), nil
 	default:
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
 	}
@@ -1008,6 +1028,10 @@ func (s *CheckService) doRequest(ctx context.Context, method, targetURL string, 
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
+	// WAF、验证码、限流及服务器故障不能作为分享失效的证据。
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return nil, resp.StatusCode, fmt.Errorf("检测上游暂不可用: HTTP %d", resp.StatusCode)
+	}
 
 	raw, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
@@ -1027,6 +1051,13 @@ func contextWithCheckHTTPClient(ctx context.Context, client *http.Client) contex
 func checkHTTPClientFromContext(ctx context.Context) *http.Client {
 	client, _ := ctx.Value(checkHTTPClientContextKey{}).(*http.Client)
 	return client
+}
+
+func checkItemCacheKey(item model.CheckItem, normalized, cacheScope string) string {
+	// 版本前缀使旧的宽松失效判定缓存失效；密码和代理各自隔离。
+	identity := strings.Join([]string{item.DiskType, normalized, item.Password, cacheScope}, "\x00")
+	sum := md5.Sum([]byte(identity))
+	return fmt.Sprintf("v2:%x", sum)
 }
 
 func checkCacheKey(diskType, normalized, cacheScope string) string {
@@ -1113,13 +1144,16 @@ func (s *CheckService) normalizeShareLink(diskType, rawURL, password string) str
 		return base
 	}
 
-	parsed.Fragment = ""
+	// Some platforms encode the share identity or password in the fragment.
+	if diskType != "mobile" && diskType != "tianyi" && diskType != "115" {
+		parsed.Fragment = ""
+	}
 	parsed.Host = strings.ToLower(parsed.Host)
 
 	query := parsed.Query()
 	if password != "" {
 		switch diskType {
-		case "baidu", "quark", "uc":
+		case "baidu", "quark", "uc", "xunlei":
 			if query.Get("pwd") == "" {
 				query.Set("pwd", password)
 			}
@@ -1130,18 +1164,25 @@ func (s *CheckService) normalizeShareLink(diskType, rawURL, password string) str
 	return parsed.String()
 }
 
+func checkCacheDirectory() string {
+	if path := strings.TrimSpace(os.Getenv("CACHE_PATH")); path != "" {
+		return path
+	}
+	return filepath.Join(".", "cache")
+}
+
 func ttlForState(state string) time.Duration {
 	switch state {
 	case checkStateOK:
-		return 24 * time.Hour
+		return 30 * time.Minute
 	case checkStateBad:
-		return 6 * time.Hour
+		return 10 * time.Minute
 	case checkStateLocked:
-		return 12 * time.Hour
+		return 5 * time.Minute
 	case checkStateUnsupported:
 		return 24 * time.Hour
 	default:
-		return 30 * time.Minute
+		return 30 * time.Second
 	}
 }
 
@@ -1248,7 +1289,20 @@ func (s *CheckService) savePersistentCache(key string, entry cachedCheckResult) 
 		if bucket == nil {
 			return nil
 		}
-		return bucket.Put([]byte(key), raw)
+		if err := bucket.Put([]byte(key), raw); err != nil {
+			return err
+		}
+		// Bound persistent entries as well as the in-memory hot cache.
+		for bucket.Stats().KeyN > 4096 {
+			oldest, _ := bucket.Cursor().First()
+			if oldest == nil {
+				break
+			}
+			if err := bucket.Delete(oldest); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -1320,6 +1374,18 @@ func buildXunleiCaptchaSignature(clientID, clientVersion, packageName, deviceID 
 	}
 
 	return timestamp, "1." + content
+}
+
+// Only messages explicitly about a share/link qualify; "token expired" or
+// "user not found" must never remove an otherwise usable search result.
+func explicitShareFailure(message string) bool {
+	return containsAny(strings.ToLower(message), []string{
+		"分享不存在", "分享链接不存在", "分享信息不存在", "分享文件不存在",
+		"分享已取消", "分享已被取消", "分享被取消", "分享已过期", "分享链接已过期",
+		"分享已失效", "分享链接已失效", "链接已失效", "链接失效", "链接不存在", "链接已过期",
+		"分享已删除", "文件已被删除", "分享因违规", "share not found", "share_not_found",
+		"share expired", "share_expired", "share_deleted", "share cancelled",
+	})
 }
 
 func containsAny(content string, keywords []string) bool {

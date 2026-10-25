@@ -1,5 +1,7 @@
 # PanSou 网盘搜索API
 
+> 本 Fork 已增加搜索 API 自动失效过滤：默认额外等待最多 2 秒，缓存优先，未确认状态保留。GitHub Actions 可构建后端 `ghcr.io/mrbad423/pansou` 和前后端集成版 `ghcr.io/mrbad423/pansou-web`。参数、构建与使用说明见 [自动链接检查与 Docker 构建](docs/自动链接检查与Docker构建.md)。下方保留上游项目说明。
+
 PanSou是一个高性能的网盘资源搜索API服务，支持TG搜索和自定义插件搜索。系统设计以性能和可扩展性为核心，支持并发搜索、结果智能排序和网盘类型分类。
 
 ## 特性（[详见系统设计文档](docs/%E7%B3%BB%E7%BB%9F%E5%BC%80%E5%8F%91%E8%AE%BE%E8%AE%A1%E6%96%87%E6%A1%A3.md)）

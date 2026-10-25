@@ -1,70 +1,148 @@
-name: 构建并发布Docker镜像
+name: Test and publish PanSou Docker images
 
 on:
   push:
-    branches:
-      - "main"
+    branches: [main]
     paths-ignore:
-      - "README.md"
-      - "docs/**"
+      - README.md
+      - docs/**
   pull_request:
-    branches:
-      - "main"
+    branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-push:
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test search filtering and existing API/service behavior
+        run: go test -race -count=1 ./api ./service ./model
+      - name: Compile all backend packages
+        run: go build ./...
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: pansou
+            file: Dockerfile
+            port: 8888
+          - image: pansou-web
+            file: Dockerfile.web
+            port: 80
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Prepare lowercase registry name
+        id: registry
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+        run: echo "image=ghcr.io/${OWNER,,}/$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build amd64 image for smoke test
+        uses: docker/build-push-action@v6
         with:
-          fetch-depth: 0
+          context: .
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: pansou-smoke:local
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
 
-      - name: 设置QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Verify image starts and health endpoint responds
+        env:
+          CONTAINER_PORT: ${{ matrix.port }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name pansou-smoke \
+            --publish "127.0.0.1:18080:$CONTAINER_PORT" \
+            --env AUTH_ENABLED=false \
+            --env ENABLED_PLUGINS=__smoke_no_plugins__ \
+            pansou-smoke:local
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error --connect-timeout 2 --max-time 3 \
+              http://127.0.0.1:18080/api/health > "$RUNNER_TEMP/health.json"; then
+              jq -e '.status == "ok"' "$RUNNER_TEMP/health.json"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs pansou-smoke
+          exit 1
 
-      - name: 设置Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-flags: --debug
+      - name: Container logs
+        if: always()
+        run: docker logs --tail 100 pansou-smoke || true
 
-      - name: 登录到GitHub容器注册表
+      - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.DOCKER }} 
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 提取Docker元数据
+      - name: Docker tags and labels
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/pansou
+          images: ${{ steps.registry.outputs.image }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: 构建并推送Docker镜像
-        uses: docker/build-push-action@v5
+      - name: Build and publish amd64 and arm64
+        uses: docker/build-push-action@v6
         with:
           context: .
-          # 这是关键修改点
+          file: ${{ matrix.file }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
           build-args: |
-            BUILD_DATE=${{ github.event.repository.updated_at }}
             VCS_REF=${{ github.sha }}
             VERSION=${{ steps.meta.outputs.version }}
+
+      - name: Published image summary
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "## Published Docker image"
+            echo
+            printf '%s\n' "$TAGS"
+            echo
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo "Search API: automatic invalid-link filtering enabled; default extra wait budget 2000ms."
+          } >> "$GITHUB_STEP_SUMMARY"
